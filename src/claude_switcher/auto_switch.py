@@ -10,7 +10,7 @@ AccountKey = tuple[str, str]
 
 def account_key(account: AccountInfo) -> AccountKey:
     """Return the stable cache key for an account."""
-    return (account.provider, account.email)
+    return (account.provider, account.profile_id)
 
 
 def should_auto_switch(active_usage: UsageState, enabled: bool, threshold: float) -> bool:
@@ -21,7 +21,7 @@ def should_auto_switch(active_usage: UsageState, enabled: bool, threshold: float
 def choose_auto_switch_target(
     provider: str,
     accounts: list[AccountInfo],
-    active_email: str,
+    active_profile_id: str,
     usage_by_account: dict[AccountKey, UsageState],
     has_credentials: Callable[[AccountInfo], bool],
     threshold: float = 100.0,
@@ -31,7 +31,7 @@ def choose_auto_switch_target(
         account
         for account in accounts
         if account.provider == provider
-        and account.email != active_email
+        and account.profile_id != active_profile_id
         and has_credentials(account)
     ]
 

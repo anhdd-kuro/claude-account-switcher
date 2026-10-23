@@ -116,3 +116,53 @@ class TestFetchUsageForAccount:
     def test_returns_none_when_no_creds(self, mock_read):
         mock_read.return_value = None
         assert fetch_usage_for_account("test@test.com") is None
+
+
+class TestProfileUsage:
+    @patch("claude_switcher.usage.urllib.request.urlopen")
+    @patch("claude_switcher.usage.keychain.read_credentials")
+    def test_same_email_profiles_use_their_saved_tokens(self, mock_read, mock_urlopen):
+        from claude_switcher.config import AccountInfo
+
+        personal = AccountInfo("same@test.com", "pro", "Personal", True, "user",
+                               organization_id="personal",
+                               keychain_service="claude-switcher:same@test.com:personal")
+        team = AccountInfo("same@test.com", "team", "Work", False, "user",
+                           organization_id="team",
+                           keychain_service="claude-switcher:same@test.com:team")
+        tokens = {personal.keychain_service: "personal-token", team.keychain_service: "team-token"}
+        mock_read.side_effect = lambda service: json.dumps({
+            "claudeAiOauth": {"accessToken": tokens[service]}
+        })
+        response = mock_urlopen.return_value.__enter__.return_value
+        response.read.return_value = b'{"five_hour": {"utilization": 25}}'
+
+        for account in (personal, team):
+            assert fetch_usage_for_account(account)["five_hour"]["utilization"] == 25
+
+        assert [call.args[0] for call in mock_read.call_args_list] == list(tokens)
+        assert [call.args[0].get_header("Authorization") for call in mock_urlopen.call_args_list] == [
+            "Bearer personal-token", "Bearer team-token",
+        ]
+
+    @patch("claude_switcher.usage.keychain.read_credentials", return_value=None)
+    def test_legacy_profile_keeps_email_credential_service(self, mock_read):
+        from claude_switcher.config import AccountInfo
+
+        account = AccountInfo("same@test.com", "pro", "Personal", False, "user",
+                              oauth_account={"organizationUuid": "personal"})
+        assert fetch_usage_for_account(account) is None
+        mock_read.assert_called_once_with("claude-switcher:same@test.com")
+
+
+def test_usage_state_keeps_only_model_limits_returned_by_api():
+    state = claude_usage_state({
+        "five_hour": {"utilization": 5},
+        "seven_day": {"utilization": 70},
+        "seven_day_sonnet": {"utilization": 25, "resets_at": "2026-10-30T00:00:00Z"},
+        "seven_day_opus": None,
+    })
+    assert [(window.label, window.percent) for window in state.windows] == [
+        ("5h", 5), ("7j", 70), ("Sonnet", 25),
+    ]
+    assert "Fable" not in [window.label for window in state.windows]

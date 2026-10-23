@@ -1,11 +1,15 @@
 """Business logic for account management."""
 
 import json
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from uuid import UUID
 
 from claude_switcher import keychain
 from claude_switcher.config import (
@@ -24,6 +28,46 @@ CLAUDE_STATE_FILE = Path.home() / ".claude.json"
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+@dataclass(frozen=True)
+class _LoginSnapshot:
+    credentials: str | None
+    keychain_account: str | None
+    oauth_account: dict | None
+
+
+def _check_storage(status: dict | None = None) -> None:
+    default_directory = CLAUDE_STATE_FILE.with_suffix("")
+    config_directory = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_directory and Path(config_directory).expanduser().resolve() != default_directory.resolve():
+        raise RuntimeError("Custom CLAUDE_CONFIG_DIR profiles are not supported by this switcher")
+    if (default_directory / ".credentials.json").exists():
+        raise RuntimeError("Claude is using file credentials; restore macOS Keychain storage before switching")
+    if status:
+        directory = status.get("configDirectory")
+        if directory and Path(directory).expanduser().resolve() != default_directory.resolve():
+            raise RuntimeError("Claude CLI and the switcher use different configuration directories")
+        if status.get("authMethod") not in (None, "claude.ai", "claudeai", "oauth"):
+            raise RuntimeError("Sign in to a Claude subscription before importing its profile")
+
+
+def _capture_login() -> _LoginSnapshot:
+    _check_storage()
+    credentials = keychain.read_credentials(CLAUDE_SERVICE)
+    account = keychain.read_account_attribute(CLAUDE_SERVICE) if credentials else None
+    if credentials and not account:
+        raise RuntimeError("Cannot preserve the current Keychain account; login was not changed")
+    return _LoginSnapshot(credentials, account, _read_oauth_account())
+
+
+def _restore_login(snapshot: _LoginSnapshot) -> None:
+    if snapshot.credentials:
+        keychain.write_credentials(CLAUDE_SERVICE, snapshot.keychain_account, snapshot.credentials)
+    else:
+        while keychain.delete_credentials(CLAUDE_SERVICE):
+            pass
+    _write_oauth_account(snapshot.oauth_account)
+
+
 def _validate_email(email: str) -> str:
     """Validate email before using it in Keychain service names."""
     if not _EMAIL_RE.match(email) or len(email) > 254:
@@ -35,19 +79,39 @@ def _read_oauth_account() -> dict | None:
     """Read the oauthAccount object from ~/.claude.json."""
     try:
         data = json.loads(CLAUDE_STATE_FILE.read_text(encoding="utf-8"))
-        return data.get("oauthAccount")
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        account = data.get("oauthAccount") if isinstance(data, dict) else None
+        return account if isinstance(account, dict) else None
+    except FileNotFoundError:
         return None
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError("Cannot read Claude account metadata; login was not changed") from exc
 
 
-def _write_oauth_account(oauth_account: dict) -> None:
+def _write_oauth_account(oauth_account: dict | None) -> None:
     """Write the oauthAccount object into ~/.claude.json (merge, not overwrite)."""
     try:
         data = json.loads(CLAUDE_STATE_FILE.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return
-    data["oauthAccount"] = oauth_account
-    CLAUDE_STATE_FILE.write_text(json.dumps(data), encoding="utf-8")
+    except FileNotFoundError:
+        if oauth_account is None:
+            return
+        data = {}
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError("Cannot read Claude configuration; the saved profile was not changed") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Invalid Claude configuration")
+    if oauth_account is None:
+        data.pop("oauthAccount", None)
+    else:
+        data["oauthAccount"] = oauth_account
+    with tempfile.NamedTemporaryFile(mode="w", dir=CLAUDE_STATE_FILE.parent, delete=False) as temp:
+        temp_path = Path(temp.name)
+        try:
+            json.dump(data, temp)
+            temp.flush()
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, CLAUDE_STATE_FILE)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
 
 _EXTRA_PATHS = [
@@ -107,6 +171,7 @@ def run_auth_login() -> bool:
 
 def import_current_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInfo | None:
     """Import the currently logged-in Claude Code account. Returns AccountInfo or None."""
+    _check_storage()
     # Retry keychain read — after login, credentials may not be written yet
     creds = None
     for _ in range(5):
@@ -119,7 +184,9 @@ def import_current_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountIn
 
     acct_attr = keychain.read_account_attribute(CLAUDE_SERVICE) or "unknown"
 
+    oauth_account = _read_oauth_account()
     status = get_auth_status()
+    _check_storage(status)
     if status and status.get("email"):
         email = status["email"]
         sub_type = status.get("subscriptionType", "unknown")
@@ -133,9 +200,25 @@ def import_current_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountIn
         org_name = ""
 
     _validate_email(email)
-    keychain.write_credentials(f"claude-switcher:{email}", acct_attr, creds)
-
-    oauth_account = _read_oauth_account()
+    metadata = oauth_account or {}
+    metadata_email = metadata.get("emailAddress")
+    if metadata_email and metadata_email != email:
+        raise RuntimeError("Claude login and account metadata disagree; sign in again before importing")
+    status_org = status.get("orgId") if status else None
+    metadata_org = metadata.get("organizationUuid")
+    if status_org and metadata_org and status_org != metadata_org:
+        raise RuntimeError("Claude login and organization metadata disagree; sign in again before importing")
+    organization_id = status_org or metadata_org or ""
+    if organization_id:
+        try:
+            UUID(organization_id)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise RuntimeError("Invalid Claude organization ID") from exc
+        if not oauth_account:
+            raise RuntimeError("Claude organization metadata is missing; sign in again before importing")
+        oauth_account = dict(oauth_account, organizationUuid=organization_id, emailAddress=email)
+    elif any(a.provider == "claude" and a.email == email and a.organization_id for a in load_accounts(config_path)):
+        raise RuntimeError("Cannot identify the Claude organization; sign in again before importing")
 
     account = AccountInfo(
         email=email,
@@ -145,87 +228,101 @@ def import_current_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountIn
         keychain_account=acct_attr,
         oauth_account=oauth_account,
         provider="claude",
+        organization_id=organization_id,
     )
+    account.keychain_service = f"claude-switcher:{account.profile_id}"
+    keychain.write_credentials(account.credential_service, acct_attr, creds)
     add_account(account, config_path)
-    set_active_account(email, config_path, provider="claude")
+    set_active_account(account.profile_id, config_path, provider="claude")
     return account
 
 
-def switch_account(target_email: str, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
-    """Switch to a different account. Saves current credentials first."""
-    active = get_active_account(config_path)
+def _saved_profile(profile_id: str, config_path: Path) -> AccountInfo:
+    account = next(
+        (a for a in load_accounts(config_path) if a.provider == "claude" and a.profile_id == profile_id),
+        None,
+    )
+    if account is None:
+        raise RuntimeError("Claude profile not found; select a saved organization profile")
+    _validate_email(account.email)
+    metadata = account.oauth_account or {}
+    if metadata.get("emailAddress", account.email) != account.email or metadata.get("organizationUuid", "") != account.organization_id:
+        raise RuntimeError("Saved profile and login metadata disagree; import this profile again")
+    if any(a.provider == "claude" and a.profile_id != profile_id and a.credential_service == account.credential_service
+           for a in load_accounts(config_path)):
+        raise RuntimeError("Saved profiles share a legacy backup; import each profile again before switching")
+    return account
 
+
+def _backup_active_account(config_path: Path, snapshot: _LoginSnapshot) -> AccountInfo | None:
+    active = get_active_account(config_path)
     if active:
-        current_creds = keychain.read_credentials(CLAUDE_SERVICE)
+        _saved_profile(active.profile_id, config_path)
+        current_creds = snapshot.credentials
+        current_oauth = snapshot.oauth_account
+        if current_creds and current_oauth:
+            email = current_oauth.get("emailAddress")
+            org = current_oauth.get("organizationUuid") or ""
+            if (email and email != active.email) or org != active.organization_id:
+                imported = import_current_account(config_path)
+                if imported is None:
+                    raise RuntimeError("Cannot preserve the current Claude login")
+                return imported
+        if current_creds and (not current_oauth or not current_oauth.get("emailAddress")):
+            raise RuntimeError("Cannot verify the current Claude organization; import its profile first")
         if current_creds:
             keychain.write_credentials(
-                f"claude-switcher:{active.email}", active.keychain_account, current_creds
+                active.credential_service, active.keychain_account, current_creds
             )
-        # Save current oauthAccount state from ~/.claude.json
-        current_oauth = _read_oauth_account()
         if current_oauth:
             active.oauth_account = current_oauth
             add_account(active, config_path)
+    return active
 
-    _validate_email(target_email)
-    target_creds = keychain.read_credentials(f"claude-switcher:{target_email}")
+
+def switch_account(target_profile_id: str, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
+    """Switch to a saved organization profile, preserving the current login."""
+    target = _saved_profile(target_profile_id, config_path)
+    if not target.oauth_account:
+        raise RuntimeError("Saved login metadata not found. Add this Claude profile again before switching.")
+    snapshot = _capture_login()
+    _backup_active_account(config_path, snapshot)
+    target_account = _saved_profile(target_profile_id, config_path)
+    target_creds = keychain.read_credentials(target_account.credential_service)
     if not target_creds:
-        raise RuntimeError(f"Credentials not found in Keychain for {target_email}")
-
-    accounts = load_accounts(config_path)
-    target_account = next(
-        (a for a in accounts if a.email == target_email and a.provider == "claude"), None
-    )
-    if not target_account:
-        raise RuntimeError(f"Account {target_email} not found in config")
-
-    keychain.write_credentials(CLAUDE_SERVICE, target_account.keychain_account, target_creds)
-
-    # Restore target's oauthAccount into ~/.claude.json
-    if target_account.oauth_account:
-        _write_oauth_account(target_account.oauth_account)
-
-    set_active_account(target_email, config_path, provider="claude")
+        raise RuntimeError("Saved Claude credentials not found in Keychain")
+    try:
+        keychain.write_credentials(CLAUDE_SERVICE, target_account.keychain_account, target_creds)
+        if target_account.oauth_account:
+            _write_oauth_account(target_account.oauth_account)
+        set_active_account(target_profile_id, config_path, provider="claude")
+    except Exception:
+        _restore_login(snapshot)
+        raise
 
 
 def add_new_account(config_path: Path = DEFAULT_CONFIG_PATH) -> AccountInfo | None:
     """Add a new account via claude auth login. Returns AccountInfo or None if cancelled."""
-    active = get_active_account(config_path)
-    if active:
-        current_creds = keychain.read_credentials(CLAUDE_SERVICE)
-        if current_creds:
-            keychain.write_credentials(
-                f"claude-switcher:{active.email}", active.keychain_account, current_creds
-            )
-
-    run_auth_logout()
-
-    # Ensure all "Claude Code-credentials" entries are gone before login.
-    # claude auth logout may not clean up the Keychain properly, and leftover
-    # entries cause security find-generic-password -w to return the OLD token
-    # instead of the freshly-issued one after login.
-    while keychain.delete_credentials(CLAUDE_SERVICE):
-        pass
-
-    if not run_auth_login():
-        if active:
-            prev_creds = keychain.read_credentials(f"claude-switcher:{active.email}")
-            if prev_creds:
-                keychain.write_credentials(CLAUDE_SERVICE, active.keychain_account, prev_creds)
-        return None
-
+    snapshot = _capture_login()
+    _backup_active_account(config_path, snapshot)
     try:
-        return import_current_account(config_path)
+        while keychain.delete_credentials(CLAUDE_SERVICE):
+            pass
+        if run_auth_login():
+            imported = import_current_account(config_path)
+            if imported:
+                return imported
     except Exception:
-        # Login succeeded but import failed — restore previous account
-        if active:
-            prev_creds = keychain.read_credentials(f"claude-switcher:{active.email}")
-            if prev_creds:
-                keychain.write_credentials(CLAUDE_SERVICE, active.keychain_account, prev_creds)
-        return None
+        _restore_login(snapshot)
+        raise
+    _restore_login(snapshot)
+    return None
 
 
-def remove_saved_account(email: str, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
-    """Remove a saved account from config and Keychain."""
-    keychain.delete_credentials(f"claude-switcher:{email}")
-    remove_account(email, config_path)
+def remove_saved_account(profile_id: str, config_path: Path = DEFAULT_CONFIG_PATH) -> None:
+    """Remove an inactive organization profile and its credential backup."""
+    account = _saved_profile(profile_id, config_path)
+    if account.active:
+        raise RuntimeError("Cannot remove the active Claude profile; switch first")
+    keychain.delete_credentials(account.credential_service)
+    remove_account(profile_id, config_path)

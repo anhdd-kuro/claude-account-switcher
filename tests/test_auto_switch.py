@@ -82,3 +82,41 @@ def test_choose_target_uses_unknown_usage_as_fallback():
     )
 
     assert chosen == unknown
+
+
+def test_same_email_profiles_have_distinct_usage_keys():
+    personal = AccountInfo("same@test.com", "pro", "Personal", True, "user",
+                           oauth_account={"organizationUuid": "personal"})
+    team = AccountInfo("same@test.com", "team", "Work", False, "user",
+                       oauth_account={"organizationUuid": "team"})
+
+    assert account_key(personal) == ("claude", "same@test.com:personal")
+    assert account_key(team) == ("claude", "same@test.com:team")
+    assert len({account_key(personal): _usage(100), account_key(team): _usage(15)}) == 2
+
+
+def test_choose_target_can_switch_to_same_email_organization():
+    personal = AccountInfo("same@test.com", "pro", "Personal", True, "user",
+                           oauth_account={"organizationUuid": "personal"})
+    team = AccountInfo("same@test.com", "team", "Work", False, "user",
+                       oauth_account={"organizationUuid": "team"})
+    usage = {("claude", "same@test.com:personal"): _usage(100),
+             ("claude", "same@test.com:team"): _usage(15)}
+
+    chosen = choose_auto_switch_target(
+        "claude", [personal, team], "same@test.com:personal", usage, lambda account: True,
+    )
+    assert chosen is team
+
+
+def test_choose_target_does_not_reselect_exhausted_active_profile():
+    personal = AccountInfo("same@test.com", "pro", "Personal", True, "user",
+                           oauth_account={"organizationUuid": "personal"})
+    team = AccountInfo("same@test.com", "team", "Work", False, "user",
+                       oauth_account={"organizationUuid": "team"})
+    usage = {("claude", "same@test.com:personal"): _usage(100),
+             ("claude", "same@test.com:team"): _usage(100)}
+
+    assert choose_auto_switch_target(
+        "claude", [personal, team], "same@test.com:personal", usage, lambda account: True,
+    ) is None

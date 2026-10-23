@@ -21,7 +21,8 @@ Claude Switcher stores account backups in macOS Keychain and swaps the active CL
 
 - **Claude Code account switching** - swap saved Claude Code sessions instantly
 - **Codex CLI account switching** - save and restore Codex `auth.json` sessions
-- **Provider-separated state** - same email can exist once for Claude and once for Codex
+- **Organization profiles** - save Personal and Team Claude profiles under the same email, with separate credentials, usage and active state
+- **Provider-separated state** - Claude profiles and Codex accounts remain independent
 - **Live usage in the menu bar** - Claude 5-hour/7-day windows and Codex primary/secondary windows
 - **Optional auto-switch** - per-provider failover when active usage reaches 100%
 - **First-launch import** - imports the currently logged-in Claude and Codex accounts when available
@@ -29,6 +30,8 @@ Claude Switcher stores account backups in macOS Keychain and swaps the active CL
 - **Standalone `.app` build** - no Python install required for normal users
 
 ## Install
+
+This fork adds organization profiles and a native remaining-usage display. Build from source below to install these changes; the upstream Homebrew cask and release downloads do not include them.
 
 ### Homebrew
 
@@ -58,6 +61,16 @@ Open the menu bar icon to:
 - enable or disable auto-switch separately for Claude and Codex
 - remove saved inactive accounts from Keychain
 
+### Personal and Team profiles with the same email
+
+1. Use **Import current Claude profile** to save the profile already signed in to Claude Code.
+2. Choose **Add Claude account...**, sign in with the same email, and select the other organization in the browser authorization page.
+3. Both profiles appear separately with their organization and plan. Click the profile you want to use.
+
+You can also run `claude auth login` yourself, select an organization, then use **Import current Claude profile**. Cancelling an in-app login restores the previous credentials and account metadata. Existing profiles with saved login metadata keep working after upgrading. If an older profile has no login metadata, the app asks you to add it again before switching; its credential backup is preserved.
+
+The menu shows remaining usage for each available limit window, with its reset time. The menu bar summarizes the active providers. Only limits returned by the provider are displayed.
+
 After switching Claude, verify from any terminal:
 
 ```bash
@@ -72,7 +85,7 @@ codex login status
 
 ## How it works
 
-Claude Code stores OAuth credentials in macOS Keychain under `Claude Code-credentials` and account metadata in `~/.claude.json`. Claude Switcher backs up each saved Claude account under `claude-switcher:{email}`, then restores the selected backup into Claude Code's active credential slot and updates `~/.claude.json`.
+Claude Code stores OAuth credentials in macOS Keychain under `Claude Code-credentials` and account metadata in `~/.claude.json`. Claude Switcher identifies profiles by email and organization UUID, backs up new profiles under `claude-switcher:{email}:{organizationUuid}`, then restores the selected backup into Claude Code's active credential slot and updates `~/.claude.json`. Older profiles retain their original `claude-switcher:{email}` backup until re-imported; their organization is recovered from saved account metadata.
 
 Codex CLI stores ChatGPT authentication in `~/.codex/auth.json` when `cli_auth_credentials_store = "file"` is used. Claude Switcher backs up each saved Codex session under `codex-switcher:{email}` and restores the selected session back to `~/.codex/auth.json` with `0600` permissions.
 
@@ -83,8 +96,8 @@ Auto-switch is disabled by default. When enabled, usage refreshes in the backgro
 ```text
 macOS Keychain
 ├── Claude Code-credentials       active Claude token
-├── claude-switcher:user1@...     saved Claude account
-├── claude-switcher:user2@...     saved Claude account
+├── claude-switcher:user@...:org1 saved Claude Personal profile
+├── claude-switcher:user@...:org2 saved Claude Team profile
 ├── codex-switcher:user1@...      saved Codex auth.json
 └── codex-switcher:user2@...      saved Codex auth.json
 
@@ -95,8 +108,18 @@ macOS Keychain
 └── tokens                        swapped on Codex account switch
 
 ~/.config/claude-switcher/accounts.json
-└── provider, email, plan, active state, settings
+└── provider, email, organization ID, credential service, plan, active state, settings
 ```
+
+## Claude storage and sessions
+
+Claude switching supports the default macOS Keychain login. Custom `CLAUDE_CONFIG_DIR` directories and `.credentials.json` fallback storage are refused before switching. Sign in and import each organization separately; copying a profile does not authenticate another organization.
+
+Already-running Claude processes may retain their previous identity. Start a fresh Claude session after switching.
+
+## UI attribution
+
+The native limits layout and provider assets are adapted from [TokenTracker](https://github.com/xiufengsun/TokenTracker), under its MIT license. Source references and license notices are bundled in `src/claude_switcher/resources/TOKEN-TRACKER-NOTICE.md`.
 
 ## Codex setup note
 
@@ -135,7 +158,7 @@ If a saved Codex session expires because its refresh token was already rotated, 
 ## Build from source
 
 ```bash
-git clone https://github.com/Symbioose/claude-account-switcher.git
+git clone https://github.com/anhdd-kuro/claude-account-switcher.git
 cd claude-account-switcher
 python3 -m venv .venv
 source .venv/bin/activate

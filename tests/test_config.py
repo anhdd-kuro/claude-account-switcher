@@ -1,4 +1,5 @@
 import json
+import pytest
 from pathlib import Path
 
 from claude_switcher.config import (
@@ -58,6 +59,28 @@ class TestLoadSave:
         assert len(loaded) == 2
         assert loaded[0].email == "a@test.com"
         assert loaded[1].active is False
+
+    def test_failed_atomic_replacement_preserves_saved_accounts(self, tmp_path, monkeypatch):
+        path = tmp_path / "accounts.json"
+        original = AccountInfo("old@test.com", "max", "Personal", True, "user")
+        save_accounts([original], path)
+        before = path.read_bytes()
+
+        def fail_replace(source, target):
+            raise OSError("disk unavailable")
+
+        monkeypatch.setattr("claude_switcher.config.os.replace", fail_replace)
+        with pytest.raises(OSError):
+            save_accounts([], path)
+        assert path.read_bytes() == before
+        assert list(tmp_path.iterdir()) == [path]
+
+    def test_corrupt_registry_cannot_be_overwritten_by_adding_account(self, tmp_path):
+        path = tmp_path / "accounts.json"
+        path.write_text('{"accounts":')
+        with pytest.raises(RuntimeError, match="configuration"):
+            add_account(AccountInfo("new@test.com", "max", "", True, "user"), path)
+        assert path.read_text() == '{"accounts":'
 
 
 class TestAccountOperations:
@@ -199,3 +222,44 @@ class TestSettings:
         set_auto_switch_enabled("claude", True, path)
         save_accounts([AccountInfo("a@test.com", "pro", "", True, "u")], path)
         assert is_auto_switch_enabled("claude", path) is True
+
+class TestOrganizationProfiles:
+    def test_same_email_profiles_save_activate_and_remove_independently(self, tmp_path):
+        path = tmp_path / "accounts.json"
+        personal = AccountInfo(
+            "user@test.com", "max", "Personal", True, "user",
+            organization_id="11111111-1111-4111-8111-111111111111",
+        )
+        team = AccountInfo(
+            "user@test.com", "team", "Work", False, "user",
+            organization_id="22222222-2222-4222-8222-222222222222",
+        )
+        codex = AccountInfo("user@test.com", "plus", "", True, "user", provider="codex")
+        for account in (personal, team, codex):
+            add_account(account, path)
+
+        assert len(load_accounts(path)) == 3
+        set_active_account(team.profile_id, path)
+        loaded = load_accounts(path)
+        assert [a.profile_id for a in loaded if a.provider == "claude" and a.active] == [team.profile_id]
+        assert next(a for a in loaded if a.provider == "codex").active
+
+        remove_account(personal.profile_id, path)
+        assert {(a.provider, a.profile_id) for a in load_accounts(path)} == {
+            ("claude", team.profile_id), ("codex", codex.profile_id),
+        }
+
+    def test_legacy_organization_metadata_retains_existing_credential_service(self, tmp_path):
+        path = tmp_path / "accounts.json"
+        path.write_text(json.dumps({"version": 2, "accounts": [{
+            "email": "user@test.com", "subscription_type": "max", "org_name": "Personal",
+            "active": True, "keychain_account": "user",
+            "oauth_account": {"organizationUuid": "11111111-1111-4111-8111-111111111111"},
+        }]}))
+
+        account = load_accounts(path)[0]
+        assert account.organization_id == "11111111-1111-4111-8111-111111111111"
+        assert account.profile_id == "user@test.com:11111111-1111-4111-8111-111111111111"
+        assert account.credential_service == "claude-switcher:user@test.com"
+        add_account(account, path)
+        assert load_accounts(path)[0].credential_service == "claude-switcher:user@test.com"

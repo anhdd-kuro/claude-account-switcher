@@ -2,11 +2,12 @@
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "claude-switcher" / "accounts.json"
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 DEFAULT_PROVIDERS = ("claude", "codex")
 
 
@@ -19,6 +20,26 @@ class AccountInfo:
     keychain_account: str
     oauth_account: dict | None = None
     provider: str = "claude"
+    organization_id: str = ""
+    keychain_service: str = ""
+
+    def __post_init__(self):
+        if self.provider == "claude" and not self.organization_id and isinstance(self.oauth_account, dict):
+            self.organization_id = self.oauth_account.get("organizationUuid") or ""
+
+    @property
+    def profile_id(self) -> str:
+        if self.provider == "claude" and self.organization_id:
+            return f"{self.email}:{self.organization_id}"
+        return self.email
+
+    @property
+    def credential_service(self) -> str:
+        if self.keychain_service:
+            if self.keychain_service != f"{self.provider}-switcher:{self.profile_id}":
+                raise ValueError("Saved credential service does not match the profile")
+            return self.keychain_service
+        return f"{self.provider}-switcher:{self.email}"
 
 
 @dataclass
@@ -48,12 +69,28 @@ def _read_config_data(path: Path = DEFAULT_CONFIG_PATH) -> dict:
 
 def _write_config_data(data: dict, path: Path = DEFAULT_CONFIG_PATH) -> None:
     """Write raw config JSON with private file permissions."""
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(existing, dict):
+                raise ValueError("Expected an object")
+        except (ValueError, OSError) as exc:
+            raise RuntimeError("Cannot overwrite unreadable account configuration") from exc
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     data.setdefault("version", CONFIG_VERSION)
     data.setdefault("settings", _default_settings_dict())
     data.setdefault("accounts", [])
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.chmod(path, 0o600)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(data, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _settings_from_dict(data: dict | None) -> AppSettings:
@@ -106,20 +143,20 @@ def save_accounts(accounts: list[AccountInfo], path: Path = DEFAULT_CONFIG_PATH)
 
 
 def add_account(account: AccountInfo, path: Path = DEFAULT_CONFIG_PATH) -> None:
-    """Add or update an account, matched by email and provider."""
+    """Add or update a provider profile."""
     accounts = load_accounts(path)
     accounts = [
         a for a in accounts
-        if not (a.email == account.email and a.provider == account.provider)
+        if not (a.profile_id == account.profile_id and a.provider == account.provider)
     ]
     accounts.append(account)
     save_accounts(accounts, path)
 
 
-def remove_account(email: str, path: Path = DEFAULT_CONFIG_PATH, provider: str = "claude") -> None:
-    """Remove an account by email and provider."""
+def remove_account(profile_id: str, path: Path = DEFAULT_CONFIG_PATH, provider: str = "claude") -> None:
+    """Remove a provider profile."""
     accounts = load_accounts(path)
-    accounts = [a for a in accounts if not (a.email == email and a.provider == provider)]
+    accounts = [a for a in accounts if not (a.profile_id == profile_id and a.provider == provider)]
     save_accounts(accounts, path)
 
 
@@ -134,13 +171,13 @@ def get_active_account(
 
 
 def set_active_account(
-    email: str, path: Path = DEFAULT_CONFIG_PATH, provider: str = "claude"
+    profile_id: str, path: Path = DEFAULT_CONFIG_PATH, provider: str = "claude"
 ) -> None:
     """Set an account active within a provider, deactivating only that provider."""
     accounts = load_accounts(path)
     for acc in accounts:
         if acc.provider == provider:
-            acc.active = (acc.email == email)
+            acc.active = (acc.profile_id == profile_id)
     save_accounts(accounts, path)
 
 

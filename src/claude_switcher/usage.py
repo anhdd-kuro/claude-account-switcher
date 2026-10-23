@@ -1,11 +1,13 @@
 """Fetch Claude API usage stats via the OAuth usage endpoint."""
 
 import json
+import math
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 
 from claude_switcher import keychain
+from claude_switcher.config import AccountInfo
 from claude_switcher.usage_state import UsageState, UsageWindow
 
 USAGE_URL = "https://api.anthropic.com/oauth/usage"
@@ -53,9 +55,10 @@ def fetch_usage(service: str) -> dict | None:
         return None
 
 
-def fetch_usage_for_account(email: str) -> dict | None:
-    """Fetch usage for a saved account by email."""
-    return fetch_usage(f"claude-switcher:{email}")
+def fetch_usage_for_account(account: AccountInfo | str) -> dict | None:
+    """Fetch usage with a profile backup, accepting legacy email callers."""
+    service = account.credential_service if isinstance(account, AccountInfo) else f"claude-switcher:{account}"
+    return fetch_usage(service)
 
 
 def fetch_active_usage() -> dict | None:
@@ -99,12 +102,21 @@ def claude_usage_state(usage: dict | None) -> UsageState:
     five_h = usage.get("five_hour", {})
     seven_d = usage.get("seven_day", {})
 
-    for label, window in (("5h", five_h), ("7j", seven_d)):
+    limits = [("5h", five_h), ("7j", seven_d)]
+    limits.extend(
+        (key.removeprefix("seven_day_").replace("_", " ").title(), window)
+        for key, window in usage.items()
+        if key.startswith("seven_day_")
+    )
+    for label, window in limits:
         if not isinstance(window, dict) or "utilization" not in window:
             continue
         try:
             percent = float(window["utilization"])
         except (TypeError, ValueError):
+            continue
+
+        if not math.isfinite(percent):
             continue
 
         reset = _format_reset_delta(window["resets_at"]) if "resets_at" in window else None
