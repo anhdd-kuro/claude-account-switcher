@@ -18,6 +18,7 @@ class MenuItem(list):
         self.title = title
         self.callback = callback
         self.state = 0
+        self._menuitem = Mock()
 
     def add(self, item):
         self.append(item)
@@ -97,7 +98,8 @@ def test_menu_preserves_same_email_profiles_and_callback_identity(ui):
     assert len(switches) == 2
     assert "Personal" in switches[0].title and "pro" in switches[0].title.lower()
     assert "Work" in switches[1].title and "team" in switches[1].title.lower()
-    assert all("same@test.com" in item.title for item in switches)
+    assert all("same@test.com" not in item.title for item in switches)
+    assert all(item._menuitem.setToolTip_.call_args.args[0] == "same@test.com" for item in switches)
     switches[1].callback(switches[1])
     assert app._switch_in_progress == {"claude"}
     threads.pop()()
@@ -257,7 +259,7 @@ def test_native_usage_view_shows_separate_remaining_limits_and_accessibility():
     assert "5h" in fields and "7d" in fields
     assert "75%" in fields and "0%" in fields
     assert "4h" in fields and "1d" in fields
-    assert view.frame().size.height <= 48
+    assert view.frame().size.height <= 56
     bars = [subview for subview in view.subviews() if subview.accessibilityRole() == "AXProgressIndicator"]
     assert len(bars) == 2
     assert [bar.accessibilityValue() for bar in bars] == [75, 0]

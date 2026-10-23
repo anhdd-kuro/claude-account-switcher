@@ -166,3 +166,16 @@ def test_usage_state_keeps_only_model_limits_returned_by_api():
         ("5h", 5), ("7j", 70), ("Sonnet", 25),
     ]
     assert "Fable" not in [window.label for window in state.windows]
+
+
+def test_null_reset_keeps_usage_windows_available():
+    state = claude_usage_state({
+        "five_hour": {"utilization": 0, "resets_at": None},
+        "seven_day": {"utilization": 12, "resets_at": "2026-10-30T00:00:00Z"},
+    })
+    assert state.available
+    assert len(state.windows) == 2
+    assert state.windows[0].percent == 0
+    assert state.windows[0].resets_in is None
+    assert state.windows[1].percent == 12
+    assert state.windows[1].resets_in

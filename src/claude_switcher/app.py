@@ -58,6 +58,16 @@ def _account_label(account):
     return f"{account.email} ({' · '.join(details)})" if details else account.email
 
 
+def _profile_label(account):
+    organization = account.org_name
+    if organization == f"{account.email}'s Organization":
+        organization = "Personal"
+    plan = account.subscription_type.replace("_", " ").title()
+    if account.provider == "codex":
+        return account.email
+    return " · ".join(value for value in (organization or account.email, plan) if value)
+
+
 def _on_main_thread(fn):
     """Schedule fn() to run on the main thread via Cocoa's operation queue."""
     NSOperationQueue.mainQueue().addOperationWithBlock_(fn)
@@ -133,9 +143,6 @@ class ClaudeSwitcherApp(rumps.App):
         claude_accounts = [a for a in accounts if a.provider == "claude"]
         codex_accounts = [a for a in accounts if a.provider == "codex"]
 
-        if accounts:
-            self.menu.add(rumps.MenuItem("Limits · Remaining", callback=None))
-
         if claude_accounts:
             self._add_provider_section("claude", claude_accounts)
         if codex_accounts:
@@ -145,13 +152,13 @@ class ClaudeSwitcherApp(rumps.App):
 
         self.menu.add(rumps.separator)
         self._add_auto_switch_menu()
-        self.menu.add(rumps.MenuItem("\u271A  Add Claude account...", callback=self._on_add_claude_account))
+        self.menu.add(rumps.MenuItem("Add Claude account...", callback=self._on_add_claude_account))
         self.menu.add(rumps.MenuItem("Import current Claude profile", callback=self._on_import_claude_profile))
-        self.menu.add(rumps.MenuItem("\u271A  Add Codex account...", callback=self._on_add_codex_account))
-        self.menu.add(rumps.MenuItem("\u21BB  Refresh usage", callback=self._on_refresh_usage))
+        self.menu.add(rumps.MenuItem("Add Codex account...", callback=self._on_add_codex_account))
+        self.menu.add(rumps.MenuItem("Refresh usage", callback=self._on_refresh_usage))
 
         if accounts:
-            remove_menu = rumps.MenuItem("\u2212  Remove account")
+            remove_menu = rumps.MenuItem("Remove account")
             for account in accounts:
                 provider_label = "Claude" if account.provider == "claude" else "Codex"
                 item = rumps.MenuItem(f"[{provider_label}] {_account_label(account)}", callback=self._on_remove_account)
@@ -162,19 +169,21 @@ class ClaudeSwitcherApp(rumps.App):
             self.menu.add(remove_menu)
 
         self.menu.add(rumps.separator)
-        self.menu.add(rumps.MenuItem("\u23FB  Quit", callback=rumps.quit_application))
+        self.menu.add(rumps.MenuItem("Quit", callback=rumps.quit_application))
 
     def _add_provider_section(self, provider: str, accounts):
-        active = next((account for account in accounts if account.active), None)
         name = "Claude" if provider == "claude" else "Codex"
-        plan = active.subscription_type.replace("_", " ").title() if active else ""
-        header = rumps.MenuItem(f"{name} {plan}".strip(), callback=None)
+        if provider == "codex" and len({a.subscription_type for a in accounts}) == 1:
+            name += " · " + accounts[0].subscription_type.replace("_", " ").title()
+        header = rumps.MenuItem(name, callback=None)
         style_provider_header(header, provider)
         self.menu.add(header)
 
         for account in accounts:
             has_creds = self._has_credentials(account)
-            label = _account_label(account)
+            label = _profile_label(account)
+            if sum(_profile_label(other) == label for other in accounts) > 1:
+                label += f" ({account.email})"
             if has_creds:
                 callback = (
                     self._on_claude_account_click
@@ -185,6 +194,7 @@ class ClaudeSwitcherApp(rumps.App):
             else:
                 item = rumps.MenuItem(f"{label} (unavailable)", callback=None)
             item.state = 1 if account.active else 0
+            item._menuitem.setToolTip_(account.email)
             item._profile_id = account.profile_id
             item._provider = provider
             self.menu.add(item)
@@ -192,7 +202,7 @@ class ClaudeSwitcherApp(rumps.App):
             if has_creds:
                 key = account_key(account)
                 state = self._usage_state_cache.get(key, UsageState(False, "Loading usage…"))
-                usage_label = rumps.MenuItem(f"Usage: {label}", callback=None)
+                usage_label = rumps.MenuItem(f"Usage: {account.profile_id}", callback=None)
                 usage_label._profile_id = account.profile_id
                 usage_label._provider = provider
                 usage_label._active = account.active

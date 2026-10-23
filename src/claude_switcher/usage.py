@@ -119,7 +119,8 @@ def claude_usage_state(usage: dict | None) -> UsageState:
         if not math.isfinite(percent):
             continue
 
-        reset = _format_reset_delta(window["resets_at"]) if "resets_at" in window else None
+        reset_at = window.get("resets_at")
+        reset = _format_reset_delta(reset_at) if isinstance(reset_at, str) and reset_at else None
         reset_suffix = f" ({reset})" if reset else ""
         parts.append(f"{label} {percent:.0f}%{reset_suffix}")
         windows.append(UsageWindow(label=label, percent=percent, resets_in=reset))
